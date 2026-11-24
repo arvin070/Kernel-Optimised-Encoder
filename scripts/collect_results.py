@@ -89,15 +89,17 @@ def summarise(R):
                    f"{fmt(L.get('max'), 2)} | {S['p50']:.2f} | {S['p99']:.2f} | {v['min_cosine']:.6f} |")
 
     out.append("\n## Profiler (torch.profiler, 2,000 passages; wall time includes profiler overhead)\n")
-    out.append("| Run | GPU kernel ms | GEMM | Attention | Norm+elementwise | Memcpy | Other | Device busy | Idle gaps >100us | Tokenise share |")
-    out.append("|---|---|---|---|---|---|---|---|---|---|")
+    out.append("GPU time = sum of kernel + memcpy durations from the exported trace (`profile_run.py --resummarise` recomputes it). "
+               "*of which FP32 GEMM*: the reference's GEMMs, or in the default config the short-input (P2) path.\n")
+    out.append("| Run | GPU kernel ms | GEMM | of which FP32 GEMM | Attention | Norm+elementwise | Memcpy | Other | Device busy | Idle gaps >100us | Tokenise share |")
+    out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for name in ("reference", "stage1", "stage2", "default"):
         v = jload(R / "profiler" / name / "summary.json")
         if not v:
-            out.append(f"| {name} | PENDING | | | | | | | | |"); continue
+            out.append(f"| {name} | PENDING | | | | | | | | | |"); continue
         sh, tl = v.get("gpu_time_share", {}), v.get("timeline", {})
         pc = lambda k: f"{100 * sh.get(k, 0):.1f}%"
-        out.append(f"| {name} | {v['gpu_kernel_ms']:.0f} | {pc('gemm')} | {pc('attention')} | {pc('norm+elementwise')} | {pc('memcpy')} | "
+        out.append(f"| {name} | {v['gpu_kernel_ms']:.0f} | {pc('gemm')} | {100 * v.get('fp32_gemm_share', 0):.1f}% | {pc('attention')} | {pc('norm+elementwise')} | {pc('memcpy')} | "
                    f"{pc('other')} | {fmt(tl.get('device_busy_fraction_of_span'), 3)} | {tl.get('idle_gaps_over_100us', '-')} | "
                    f"{fmt(v.get('tokenise_share_of_wall'), 3)} |")
 

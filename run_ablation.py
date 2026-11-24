@@ -47,6 +47,18 @@ def res32_on(cfg):
     return False
 
 
+def short_fp32(cfg):
+    """P2 cut-off (tokens) when the stage uses FP16: PS09_SHORT_FP32 or team.py's DEFAULT_SHORT_FP32; 0 = off."""
+    if not cfg.get("fp16"):
+        return 0
+    if "PS09_SHORT_FP32" in os.environ:
+        return int(os.environ["PS09_SHORT_FP32"])
+    for line in (HERE / "team.py").read_text(encoding="utf-8").splitlines():
+        if line.startswith("DEFAULT_SHORT_FP32"):
+            return int(line.split("=")[1].split("#")[0].strip())
+    return 0
+
+
 def default_budget():
     src = (HERE / "team.py").read_text(encoding="utf-8")
     for line in src.splitlines():
@@ -138,7 +150,7 @@ def main():
         wall = round(time.time() - t, 1)
         print(open(log).read()[-3000:], flush=True)
         base = {"when": time.strftime("%Y-%m-%d %H:%M"), "stage": st, "name": NAMES.get(st), "tag": a.tag,
-                "flags": " ".join([k for k in FLAGS if cfg.get(k)] + (["res32"] if res32_on(cfg) else [])), "token_budget": budget,
+                "flags": " ".join([k for k in FLAGS if cfg.get(k)] + (["res32"] if res32_on(cfg) else []) + ([f"short32<={short_fp32(cfg)}"] if short_fp32(cfg) else [])), "token_budget": budget,
                 "peak_gpu_mib": mem.peak_mib(), "wall_s": wall, "result_file": str(out.relative_to(HERE)) if out.is_relative_to(HERE) else str(out)}
         if p.returncode != 0 or not out.exists():
             rows.append(dict(base, status=f"FAILED (exit {p.returncode}, see {log.name})")); continue

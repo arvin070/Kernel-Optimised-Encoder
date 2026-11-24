@@ -11,7 +11,10 @@ Same weights, same architecture, same maths as reference.py. What changes is HOW
   O4  optional torch.compile of the layer stack
   O5  CLS-only last layer (keys/values for all tokens, everything else for the CLS row only)
   O7  live path: one query -> fixed length bucket -> CUDA Graph replay
-  P1  precision: FP16 GEMMs/attention with an FP32 residual stream + LayerNorm (DEFAULT_RES32), FP32 GEMM reductions
+  P1  precision: FP16 GEMMs/attention with FP32 GEMM reductions; optional FP32 residual stream + LayerNorm (DEFAULT_RES32)
+  P2  short inputs (<= SHORT_FP32 tokens) run in FP32 with reference maths, both offline and live. On the 100k
+      practice set every FP16 result below cosine 0.9999 was <= 23 tokens long (worst 0.9944 at 16 tokens); above 32
+      tokens plain FP16 is >= 0.99999. Short inputs are 33% of passages but only 5.5% of tokens, so FP32 there is cheap.
 
 Every optimisation can be switched off with environment variables, so each phase can be measured on its own
 (see run_ablation.py). PS09_STAGE picks a preset; individual PS09_<FLAG> variables override it.
@@ -31,8 +34,9 @@ import torch.nn.functional as F
 
 # ---- submitted defaults (scripts/apply_best_config.py --apply edits the first two) ----
 DEFAULT_STAGE = 4
-DEFAULT_TOKEN_BUDGET = 65536
-DEFAULT_RES32 = 1   # FP32 residual stream + LayerNorm on top of FP16 GEMMs: precision safety margin (see TRACKER.md)
+DEFAULT_TOKEN_BUDGET = 8192
+DEFAULT_RES32 = 0   # FP32 residual stream + LayerNorm on top of FP16 GEMMs (12% slower; superseded by P2, see TRACKER.md)
+DEFAULT_SHORT_FP32 = 32   # P2: inputs of at most this many tokens run in FP32 (0 = off)
 
 MODEL = os.environ.get("PS09_MODEL", "BAAI/bge-base-en-v1.5")
 MAX_LEN = 512
@@ -57,6 +61,7 @@ TOKEN_BUDGET = int(os.environ.get("PS09_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET))  #
 # Experimental precision switches (default off; measured with validate.py before any use):
 BF16 = int(os.environ.get("PS09_BF16", "0"))              # BF16 instead of FP16 (if the GPU supports it)
 RES32 = int(os.environ.get("PS09_RES32", DEFAULT_RES32))  # FP32 residual stream + LayerNorm (precision margin)
+SHORT_FP32 = int(os.environ.get("PS09_SHORT_FP32", DEFAULT_SHORT_FP32))  # P2 cut-off in tokens (0 = off)
 FP16_ACCUM = int(os.environ.get("PS09_FP16_ACCUM", "0"))  # FP16 accumulation in GEMMs (2x on GeForce, less precise)
 FIXED_BATCH = 32                                                    # used when budget batching is off
 CHUNK = int(os.environ.get("PS09_CHUNK", "16384"))                  # texts tokenised per producer step
@@ -179,13 +184,16 @@ def setup():
     tok = AutoTokenizer.from_pretrained(MODEL)
     hf = AutoModel.from_pretrained(MODEL).float().eval()
     enc = Encoder(hf, dtype, device, res32=RES32)
+    # P2: FP32 copy of the same weights for short inputs (only when the main path is half precision)
+    enc32 = Encoder(hf, torch.float32, device) if dtype != torch.float32 and SHORT_FP32 > 0 else None
     del hf
     fast = tok.backend_tokenizer          # Rust tokenizer: batch encoding releases the GIL
     fast.enable_truncation(MAX_LEN)       # max_length counts [CLS]/[SEP], same as the reference call
     fast.no_padding()
     torch.set_grad_enabled(False)
     _S.update(tok=tok, fast=fast, enc=enc, device=device, dtype=dtype, cuda=cuda, notes=notes,
-              pad_id=tok.pad_token_id or 0, fwd=enc.forward, graphs={}, compiled=False)
+              pad_id=tok.pad_token_id or 0, fwd=enc.forward, graphs={}, compiled=False,
+              enc32=enc32, fwd32=enc32.forward if enc32 else None)
 
     if cuda:
         if CFG["compile"]:
@@ -221,6 +229,11 @@ def _warmup():
                     _S["fwd"](ids, attn, True, cls)
                     if _S["compiled"]:
                         _S["fwd"](ids, attn, False, cls)  # unmasked variant used by uniform-length batches
+                if _S["fwd32"] is not None:  # P2 FP32 path, only at the short shapes it serves
+                    for T in (32, 24, 16, 8):
+                        if T <= _pad8(SHORT_FP32):
+                            ids = torch.full((max(1, TOKEN_BUDGET // T), T), 101, device=dev)
+                            _S["fwd32"](ids, torch.ones_like(ids), True, cls)
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated(dev)
             if peak > 0.75 * total and TOKEN_BUDGET > 4096:
@@ -242,10 +255,11 @@ def _warmup():
 
 def runtime_info():
     """What actually runs on this machine (for logs and the report)."""
-    info = {"stage": STAGE, "cfg": dict(CFG), "token_budget": TOKEN_BUDGET, "torch": torch.__version__,
+    info = {"stage": STAGE, "cfg": dict(CFG), "token_budget": TOKEN_BUDGET, "short_fp32": SHORT_FP32, "torch": torch.__version__,
             "cuda_available": torch.cuda.is_available(), "model": MODEL}
     if _S:
         info.update(device=str(_S["device"]), dtype=str(_S["dtype"]).replace("torch.", ""), res32=_S["enc"].res32,
+                    short_fp32_active=_S["enc32"] is not None,
                     compiled=_S["compiled"], graph_buckets=sorted(_S["graphs"]), notes=list(_S["notes"]))
         if _S["cuda"]:
             p = torch.cuda.get_device_properties(_S["device"])
@@ -256,9 +270,11 @@ def runtime_info():
 
 
 def _capture_graphs():
-    """O7: one CUDA Graph per live bucket. Replay launches the whole 12-layer forward in one call."""
-    enc, device = _S["enc"], _S["device"]
+    """O7: one CUDA Graph per live bucket. Replay launches the whole 12-layer forward in one call.
+    P2: a bucket no longer than SHORT_FP32 is captured on the FP32 encoder."""
+    device = _S["device"]
     for T in LIVE_BUCKETS:
+        enc = _S["enc32"] if _S["enc32"] is not None and T <= SHORT_FP32 else _S["enc"]
         ids = torch.zeros((1, T), dtype=torch.long, device=device)
         attn = torch.zeros((1, T), dtype=torch.long, device=device)
         ids[0, 0], attn[0, 0] = 101, 1
@@ -290,6 +306,8 @@ def _plan(lengths):
     if not CFG["budget"]:
         return [order[i:i + FIXED_BATCH] for i in range(0, n, FIXED_BATCH)]
     bucket = CFG["sort"] and CFG.get("bucket", 0)
+    # P2: the first n_long sorted rows run in half precision, the rest (<= SHORT_FP32 tokens) in FP32; never mix them
+    n_long = int((lengths > SHORT_FP32).sum()) if CFG["sort"] and _short_on() else n
     if bucket:
         neg_p = -((lengths[order] + 7) // 8 * 8)   # ascending, because order is longest first
         # minimum batch size before a bucket split: MIN_FILL x budget, but never more than a quarter of this call's
@@ -303,9 +321,15 @@ def _plan(lengths):
         if bucket:  # first row whose padded length is below T, but keep at least MIN_FILL of the budget
             k = int(np.searchsorted(neg_p, -T, side="right"))
             end = min(end, max(k, i + max(1, int(fill_tokens // T))))
+        if i < n_long:
+            end = min(end, n_long)
         batches.append(order[i:end])
         i = end
     return batches
+
+
+def _short_on():
+    return SHORT_FP32 > 0 and bool(_S) and _S.get("fwd32") is not None
 
 
 def _build(enc_list, idx, lengths, offset=0):
@@ -319,11 +343,12 @@ def _build(enc_list, idx, lengths, offset=0):
         ids[r, :len(e)] = e
         attn[r, :len(e)] = 1
     uniform = bool(lengths[idx].min() == T)  # no padding at all -> run attention without a mask
+    fp32 = _short_on() and bool(lengths[idx].max() <= SHORT_FP32)  # P2: whole batch is short -> FP32 path
     ids_t, attn_t = torch.from_numpy(ids), torch.from_numpy(attn)
     idx_t = torch.from_numpy(np.ascontiguousarray(idx + offset, dtype=np.int64))
     if _S["cuda"]:  # pinned (page-locked) host memory -> truly asynchronous host-to-device copies
         ids_t, attn_t, idx_t = ids_t.pin_memory(), attn_t.pin_memory(), idx_t.pin_memory()
-    return ids_t, attn_t, idx_t, uniform
+    return ids_t, attn_t, idx_t, (uniform, fp32)
 
 
 def _tokenise(texts):
@@ -358,18 +383,20 @@ def _producer(texts, q, offset_chunks, stop):
         _put(q, ex, stop)
 
 
-def _run_batch(ids_t, attn_t, uniform):
+def _run_batch(ids_t, attn_t, mode):
+    uniform, fp32 = mode
     dev = _S["device"]
     ids = ids_t.to(dev, non_blocking=True)
     attn = attn_t.to(dev, non_blocking=True)
+    fwd = _S["fwd32"] if fp32 else _S["fwd"]
     try:
-        return _S["fwd"](ids, attn, not uniform, bool(CFG["cls_only"]))
+        return fwd(ids, attn, not uniform, bool(CFG["cls_only"]))
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         h = ids.shape[0] // 2
         if h == 0:
             raise
-        return torch.cat([_run_batch(ids_t[:h], attn_t[:h], uniform), _run_batch(ids_t[h:], attn_t[h:], uniform)])
+        return torch.cat([_run_batch(ids_t[:h], attn_t[:h], mode), _run_batch(ids_t[h:], attn_t[h:], mode)])
 
 
 # ----------------------------------------------------------------------------------------------- encode
@@ -379,6 +406,8 @@ def _encode_live(text):
     T = next((b for b in LIVE_BUCKETS if b >= len(ids)), None)
     if T is None:
         return None
+    if _short_on() and (len(ids) <= SHORT_FP32) != (T <= SHORT_FP32):
+        return None  # bucket precision does not match this query's (cut-off not on a bucket edge): batch path
     g, s_ids, s_attn, s_out, h_ids, h_attn = _S["graphs"][T]
     h_ids.zero_(); h_attn.zero_()
     h_ids[0, :len(ids)] = torch.tensor(ids)

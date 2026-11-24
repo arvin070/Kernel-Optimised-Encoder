@@ -10,15 +10,15 @@ Evidence labels: **measured** (file named) · **CPU emulation** · **reported** 
 |---|---|---|---|---|
 | 0 | Analysis and planning | ✅ | `docs/*.pdf` | Mean 100.2 tokens; 80.4% padding (re-measured exactly, `results_cpu/workload_stats.json`) |
 | 1 | Code and correctness harness | ✅ | `team.py`, `validate.py`, `tests/test_correctness.py` | CPU FP32: 34/34 edge-case checks pass, min cos 1.0000000 (stages 0, 2, 4) |
-| 2 | GPU baseline and "before" profile | ⏳ | `results_gpu/hardware/`, `results_gpu/profiler/reference/` | Baseline **reported** 28.4 p/s (RTX 3050, 5,000 passages); file not in repo; re-measured by `run_all.sh --step env` if missing |
-| 3 | S1: FP16, fused QKV, SDPA | ⏳ | `results_gpu/ablation/` | — |
-| 4 | S2: token-budget scheduler (+ O2b bucket split) | 🧪 / ⏳ | `results_cpu/workload_stats.json` | Work vs reference 5.25x (S2) / **5.62x** (S4) exact; GPU throughput pending |
-| 5 | S3: async pipeline + CUDA Graph live path | ⏳ | `results_gpu/ablation/`, `results_gpu/latency/` | — |
-| 6 | S4: CLS-only last layer | 🧪 / ⏳ | CPU dry run | exact on CPU (min cos 1.0) |
-| 7 | S5: torch.compile | ⏳ | `results_gpu/ablation/` | keep only if faster |
-| 8 | Precision study and fix (P1) | 🧪 / ⏳ | `results_cpu/precision_study.json`, `results_cpu/test_lowprec_cpu.json` | worst case = short passages; FP32 residual default on; BF16 rejected |
-| 9 | Budget sweep, full 100k validation, "after" profiles | ⏳ | `results_gpu/token_budget/`, `results_gpu/final/` | — |
-| 10 | Report, demo, Q&A | 🧪 | `docs/technical_report.md`, `reports/`, `demo.py`, `docs/demo_guide.md`, `docs/judge_qa.md` | GPU sections PENDING |
+| 2 | GPU baseline and "before" profile | ✅ | `results_gpu/hardware/ref_throughput.json`, `results_gpu/profiler/reference/` | 28.4 p/s (RTX 3050, 5,000 passages, recovered file); 75% FP32 GEMM, 136 idle gaps >100 µs |
+| 3 | S1: FP16, fused QKV, SDPA | ✅ | `results_gpu/ablation/` | 85.9 p/s (3.0x), 20k |
+| 4 | S2: token-budget scheduler (+ O2b bucket split) | ✅ | `results_gpu/ablation/`, `results_gpu/repeats/` | 427 p/s (15x) at budget 65,536; O2b +2.9% (3 interleaved rounds) |
+| 5 | S3: async pipeline + CUDA Graph live path | ✅ | `results_gpu/ablation/`, `results_gpu/latency/` | FP16 query service 2.49 → 1.76 ms with graphs |
+| 6 | S4: CLS-only last layer | ✅ | `results_gpu/ablation/` | exact; +8% in the 20k ablation |
+| 7 | S5: torch.compile | ❌ | `results_gpu/ablation/` | 494 p/s but setup 197 s and min cos 0.99986; not submitted |
+| 8 | Precision (P1 → P2) | ✅ | `results_gpu/final/full_check*.json`, `results_gpu/repeats_p2/` | 100k check: plain FP16 2 violations, FP32 residual 1; **P2 (≤ 32 tokens in FP32): 0, min 0.999992** |
+| 9 | Budget sweep, full 100k validation, "after" profiles | ✅ | `results_gpu/token_budget/`, `results_gpu/final/`, `results_gpu/profiler/` | budget 8,192; **604.9 p/s, 21.3x** on 100k; 7 idle gaps, 99.7% busy |
+| 10 | Report, demo, Q&A | ✅ | `reports/PS09_Final_Report.pdf`, `results_gpu/demo_gpu_output.txt`, `docs/judge_qa.md` | GPU demo: 20.6x on 2,000, min cos 0.999999, live p50 3.72 ms |
 
 ## Task list (session 2026-11-23, Windows laptop, no GPU)
 
@@ -32,17 +32,17 @@ Evidence labels: **measured** (file named) · **CPU emulation** · **reported** 
 | Fix: producer thread could hang after an error | 🧪 | `team.py` `_put`, `_encode` | stop event; thread always joins |
 | Fix: index copy was not truly async | 🧪 | `team.py` `_build` | index tensor now pinned; chunk offset added before pinning |
 | Fix: small calls padded heavily (O2b min fill) | 🧪 | `team.py` `_plan` | min batch before a bucket split capped at a quarter of the call's tokens: 200 passages 43.8% → 10.1% padding; 100k unchanged |
-| Robust setup on unknown GPUs | 🧪 / ⏳ | `team.py` `setup`, `_warmup`, `runtime_info` | warm-up at real shapes largest first; budget halves on OOM / >75% VRAM; compile and graph failures fall back to eager |
-| O2b length-bucket split | 🧪 / ⏳ | `team.py` `_plan`; `results_cpu/workload_stats.json` | padding 10.0% → 3.7% at budget 65,536 (exact); small calls (200 passages) 43.8% → 10.1%; GPU speed pending (`PS09_BUCKET=0` row in ablation) |
-| P1 FP32 residual stream (default) | 🧪 / ⏳ | `team.py` `Encoder(res32)`; `results_cpu/test_lowprec_cpu.json` | native CPU FP16 worst 0.999680 → 0.999960 with res32; GPU accuracy and speed cost pending |
-| cuBLAS reduced-precision reductions off | ⏳ | `team.py` `setup` | hypothesis for GPU 0.999663 vs emulated 0.999879; `validate_lax_reduction` compares |
+| Robust setup on unknown GPUs | ✅ | `team.py` `setup`, `_warmup`, `runtime_info` | ran on the RTX 3050 with no variables set; warm-up peak 0.94 GiB at budget 8,192. Note: the 75% check uses allocated memory at warm-up, while nvidia-smi peaks include the allocator cache and graphs, so at 65,536 the device peak was ~90% without halving - one reason 8,192 was chosen |
+| O2b length-bucket split | ✅ | `team.py` `_plan`; `results_gpu/repeats/` | padding 10.0% → 3.7% (exact); GPU +2.9% (609.6 → 627.6 p/s, 3 rounds) |
+| P1 FP32 residual stream | ❌ superseded | `team.py` `Encoder(res32)`, `results_gpu/archive_before_short_fp32/` | GPU: worst on official 2,000 0.999663 → 0.999991, but 100k check still 1 violation; 12% slower. Replaced by P2 |
+| cuBLAS reduced-precision reductions off | ✅ | `results_gpu/accuracy/validate_lax_reduction.json` | no measurable effect on this GPU (0.999991 both ways); kept off as a safe default |
 | BF16 | ❌ | `results_cpu/precision_study.json` | min cos 0.9918, 8/2000 under 0.9995 (CPU emulation) |
-| Issue A: GPU artifacts missing | ⛔ | — | Earlier GPU files only on the Ubuntu laptop (`~/Desktop/ps09/results/` if installed with the old installer). `run_all.sh` copies `results/ref_throughput.json` into `results_gpu/hardware/` if found |
+| Issue A: GPU artifacts missing | ✅ | `results_gpu/earlier_code/`, `results_gpu/hardware/` | recovered from `~/Desktop/ps09/results/` on the RTX machine (earlier code: 666 p/s, 23.45x on 100k with plain FP16) |
 | Issue B: run_all.ps1 ran stage 0 on 100k | ✅ | `run_all.ps1` | now the Windows CPU workflow; never runs stage 0 on 100k; hands over to run_all.sh if a CUDA GPU exists |
 | Issue C: stale installer | ✅ | `scripts/build_installer.py`, `install_ps09.sh`, `.gitattributes` | installer generated from canonical files, LF endings; `--check` run by run_all.ps1 |
-| Issue D: GPU tests | ⏳ | `run_all.sh` | one restartable command; see "Next commands" |
-| Ubuntu workflow | 🧪 | `run_all.sh` | bash syntax checked on Windows; not yet executed on the GPU |
-| Report generator + PDF | 🧪 | `scripts/make_report.py`, `reports/` | built on Windows with CPU evidence; GPU sections PENDING |
+| Issue D: GPU tests | ✅ | `results_gpu/accuracy/test_correctness.json` | 29 edge cases on GPU, stages 1-4: all pass |
+| Linux GPU workflow | ✅ | `run_all.sh` | ran end to end on the RTX 3050 (Arch Linux), quick path and `--full`, exit 0 |
+| Report generator + PDF | ✅ | `scripts/make_report.py`, `reports/` | rebuilt on Linux with GPU results (Brave headless for the PDF); profiler breakdown fixed (annotation double-count, attention mis-classified as GEMM) |
 | Demo script | 🧪 | `demo.py`, `results_cpu/demo_cpu_output.txt` | run on CPU (`--n 200`): all sections OK; GPU run pending |
 
 ## Results log
@@ -63,11 +63,26 @@ Evidence labels: **measured** (file named) · **CPU emulation** · **reported** 
 | 23 Nov, 22:30 | Windows, native CPU FP16 | `tests/test_lowprec_cpu.py`, 13 passages incl. worst 8 | FP16 min 0.999680 (#19, 8 tokens) · FP16+res32 0.999960 | measured |
 | 23 Nov, 22:10 | Windows i7-13620H, CPU FP32 | Official `bench.py` via `run_ablation.py`, 300 passages, budget 8192 | S0 3.5 p/s (0.97×) · S2 17.8 (4.94×) · S4 18.6 (**5.17×**); 0 violations, min cos 1.0 | measured (not a GPU score) |
 | 23 Nov, 22:50 | Windows i7-13620H, CPU FP32 | same, after the small-call plan fix | S2 18.2 p/s (5.05×) · S4 19.1 p/s (**5.32×**); 0 violations, min cos 1.0; files `results_cpu/bench_dryrun/` | measured (not a GPU score) |
+| 24 Nov, 00:37 | RTX 3050 6GB Laptop, Linux | `run_all.sh` quick path (tests, accuracy, ablation, sweep, latency, profiles) | all OK except BF16 (expected fail) | measured |
+| 24 Nov, 01:40 | RTX 3050, Linux | 3 interleaved rounds, budget 16,384 | default 627.6 · RES32 off 701.9 · O2b off 609.6 p/s | measured |
+| 24 Nov, 03:00 | RTX 3050, Linux | `run_all.sh --full`, P1 config | 621.3 p/s (21.9x); 100k check **1 violation** (0.99779) | measured, archived |
+| 24 Nov, 05:40 | RTX 3050, Linux | `run_all.sh --full`, P2 config (submitted) | **604.9 p/s (21.3x)**, 0 violations, 100k min 0.999992; live p50 4.4 / p99 8.2 ms | measured |
+| 24 Nov, 06:30 | RTX 3050, Linux | 3 interleaved rounds, budget 8,192 | P2 598.7 · P1 619.0 · plain FP16 692.2 p/s | measured |
+| 24 Nov, 06:50 | RTX 3050, Linux | `demo.py` | 20.6x on 2,000; min cos 0.999999; live p50 3.72 ms | measured |
 | 23 Nov, 22:45 | Windows, CPU | `demo.py --n 200 --queries 30` | min cos 1.000000; 4.90× vs reference on 200 passages; padding 79.8% → 10.1%; `results_cpu/demo_cpu_output.txt` | measured (not a GPU score) |
 
 ## Decisions
 
-- **FP32 residual stream on by default** (P1): native FP16 kernels lose more precision than ideal rounding, the worst
+- **Submitted config (24 Nov):** stage 4, token budget 8,192, P2 short inputs (≤ 32 tokens) in FP32, FP32 residual off.
+  Official bench.py on 100k: 604.9 p/s (21.3x), 0 violations; all 100k ≥ 0.999992 vs FP32; live p50 4.4 / p99 8.2 ms.
+- **P2 replaces P1** (24 Nov): the full 100k check found 1 violation with the FP32 residual (0.99779, 16 tokens) and 2
+  with plain FP16; every FP16 result < 0.9999 was ≤ 23 tokens. P2 gives 0 at 598.7 p/s vs 619.0 (P1) and 692.2 (plain),
+  3 interleaved rounds each.
+- **Live queries in FP32** (24 Nov): +2 ms p50 accepted for zero precision risk on the hidden trace.
+- **Budget 8,192** (24 Nov): sweep within 1% of the fastest, a third of the memory; 65,536 used ~90% of VRAM and timings
+  drifted 34% between identical runs.
+- *Superseded:*
+  **FP32 residual stream on by default** (P1): native FP16 kernels lose more precision than ideal rounding, the worst
   inputs are short passages, and one violation zeroes the run. Cost is element-wise only (estimate 5-10%); the GPU
   ablation row "RES32 off" measures it. Revisit only if the 100k check of plain FP16 stays above 0.9995 AND the speed
   gain is > 3%.
@@ -80,12 +95,7 @@ Evidence labels: **measured** (file named) · **CPU emulation** · **reported** 
 - The internal accuracy gate is a minimum cosine ≥ 0.9995; the official limit is 0.999.
 - Defaults the organisers get: `DEFAULT_STAGE`, `DEFAULT_TOKEN_BUDGET`, `DEFAULT_RES32` at the top of `team.py`.
 
-## Next commands (Ubuntu RTX 3050 machine)
+## Next commands
 
-```bash
-cd <project folder>            # git pull, or: bash install_ps09.sh ~/ps09 --no-run && cd ~/ps09
-bash run_all.sh                # ~1-1.5 h: env, tests, accuracy, ablation 20k, budget sweep, latency, profiles
-python scripts/apply_best_config.py --sweep results_gpu/token_budget/ablation.csv --stage 4 --apply
-bash run_all.sh --full         # final 100k official bench + 100k accuracy check
-```
-Then copy `results_gpu/` (and `team.py` if the defaults changed) back and run `run_all.ps1 -Report`.
+Nothing is required on the GPU. To reproduce: `bash run_all.sh && bash run_all.sh --full` (restartable), then
+`python scripts/make_report.py` for the report and PDF.

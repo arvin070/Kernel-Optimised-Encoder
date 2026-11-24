@@ -17,16 +17,24 @@ model runs:
 1. **Length-aware scheduling** (sort by length, token-budget batches, split at length buckets): token positions
    computed drop from 51.2 M to 10.4 M for 100k passages; with the CLS-only last layer the analytical work is
    **5.62x lower** than the reference (measured, exact count).
-2. **FP16 Tensor-Core GEMMs with an FP32 residual stream**, fused QKV projection and PyTorch's fused SDPA attention.
+2. **FP16 Tensor-Core GEMMs**, fused QKV projection and PyTorch's fused SDPA attention.
 3. **Overlapped host pipeline** (tokenisation in a background thread, pinned memory, asynchronous copies, one sync).
 4. **CLS-only last layer**: the last layer computes keys/values for all tokens but everything else for the CLS row only.
 5. **CUDA Graphs for live queries**: one graph replay per query instead of hundreds of kernel launches.
+6. **Short inputs in FP32** (P2): inputs of at most 32 tokens run through an FP32 copy of the same weights, offline and
+   live; everything longer runs in FP16.
 
-Accuracy is protected by a **precision gate** (minimum cosine ≥ 0.9995 internally, 0.999 is the rule). A CPU precision
-study found that the worst cases are *short* passages and that keeping the residual stream in FP32 cuts the worst-case
-error several-fold at the cost of only element-wise work, so it is on by default.
+Accuracy is protected by a **precision gate** (minimum cosine ≥ 0.9995 internally, 0.999 is the rule) and by a check
+of **all 100,000 practice passages** against our FP32 path, not only the 2,000 the official harness checks. That full
+check found what the 2,000-passage check could not: with FP16 everywhere, 2 of 100,000 passages fell below 0.999
+(worst 0.99440), and even with an FP32 residual stream 1 did (0.99779). Every FP16 result below 0.9999 was a passage
+of at most 23 tokens; above 32 tokens plain FP16 is ≥ 0.99999. Short passages are 33% of the passages but only 5.5% of
+the tokens, so running them in FP32 removes the risk at a small cost (Section 11).
 
-GPU throughput, latency and profiler results: see Section 13 onwards (PENDING until the RTX 3050 runs complete).
+**Result on the RTX 3050 6GB Laptop GPU (measured, official `bench.py`, all 100,000 practice passages):
+604.9 passages/s against the reference's 28.4, a 21.3x speed-up**, 0 tolerance violations, minimum cosine 0.999992
+over all 100,000 passages against FP32 (0.999999 on the official 2,000), live p50 4.4 ms / p99 8.2 ms, peak GPU memory
+1.6 GB. Sections 13-18 give the ablation, budget sweep, latency, profiles and accuracy evidence.
 
 ## 2. Problem statement
 
@@ -51,8 +59,8 @@ token of the last hidden state, L2-normalised, `.cpu()` after every batch.
 | Padding to 512 | dense layers cost ∝ padded length, attention ∝ length² | 80.4% padding (measured) |
 | FP32 arithmetic | no FP16 Tensor Cores; twice the bytes moved | architecture (estimate) |
 | Pooler and full last layer | only the CLS row of the last layer is used | model structure |
-| Per-batch `.cpu()` sync | GPU idles while the CPU tokenises the next batch | profiler (PENDING) |
-| Single queries | ~200 small kernels each, launch-bound | profiler (PENDING) |
+| Per-batch `.cpu()` sync | GPU idles while the CPU tokenises the next batch | profiler: 136 device idle gaps > 100 µs per 2,000 passages (reference) vs 7 (ours) |
+| Single queries | ~200 small kernels each, launch-bound | FP16 service time 2.49 ms eager vs 1.76 ms with a CUDA Graph (measured) |
 
 ## 5. Model and hardware
 
@@ -94,14 +102,16 @@ Length-bucket split (O2b) at the 65,536-token budget: padding 10.0% -> 3.7%, wor
 ## 8. Proposed architecture
 
 ```
-setup()  (not timed)  load weights -> FP16 GEMM weights, FP32 LayerNorm -> warm up at the real batch shapes
+setup()  (not timed)  load weights -> FP16 copy + FP32 copy (short inputs) -> warm up at the real batch shapes
                       (largest first; halve the token budget if the GPU is too small) -> capture CUDA Graphs (32/64/128)
 
 encode(texts)
  ├─ 1 text  -> tokenise -> copy into the static buffers of the smallest bucket -> graph.replay() -> [1,768]
+ │            (the 32-token graph is captured on the FP32 copy; 64/128 on FP16)
  └─ N texts -> producer thread: tokenise 16k-text chunks (Rust tokenizer, no padding)
                  -> sort by length -> token-budget batches split at multiple-of-8 length buckets -> pinned tensors
-             -> consumer (main thread): async H2D copy -> 12-layer FP16 encoder (fused QKV, SDPA, CLS-only last layer)
+             -> consumer (main thread): async H2D copy -> 12-layer encoder (fused QKV, SDPA, CLS-only last layer):
+                    FP16 for batches of inputs > 32 tokens, FP32 for batches of inputs <= 32 tokens (never mixed)
                  -> CLS -> FP32 L2-normalise -> scatter into a preallocated [N,768] GPU buffer in input order
              -> one device-to-host copy at the end
 ```
@@ -117,7 +127,8 @@ encode(texts)
 | O5 | CLS-only last layer | 11/12 of last-layer work unused | `PS09_CLS_ONLY` | S4+ |
 | O7 | CUDA Graph per live bucket (32/64/128 tokens) | kernel-launch overhead for single queries | `PS09_GRAPH` | S3+ |
 | O4 | `torch.compile` of the encoder | element-wise kernel fusion | `PS09_COMPILE` | S5 |
-| P1 | FP32 residual stream + LayerNorm (GEMMs stay FP16) | FP16 rounding of the residual stream | `PS09_RES32` | default on |
+| P1 | FP32 residual stream + LayerNorm (GEMMs stay FP16) | FP16 rounding of the residual stream | `PS09_RES32` | off (superseded by P2) |
+| P2 | Inputs of ≤ 32 tokens in FP32 (separate batches and the 32-token live graph) | FP16 error on short inputs | `PS09_SHORT_FP32` (cut-off, 0 = off) | default 32 |
 
 Stages are cumulative presets (`PS09_STAGE=0..5`); each flag can be overridden alone for ablations. The submitted
 defaults are constants at the top of `team.py`; the organisers do not need to set any variable.
@@ -174,8 +185,23 @@ does not help - the error accumulates in the residual stream; (3) an FP32 residu
 worst-case error several-fold at the cost of element-wise work only; (4) BF16 (8-bit mantissa) is not accurate enough;
 (5) real FP16 kernels lose more than ideal rounding (native CPU FP16 0.999680 on passage #19 vs 0.999879 emulated,
 close to the 0.999663 the teammate measured on the GPU), which is why `setup()` also disables cuBLAS reduced-precision
-reductions. Maximum activation seen 16.4 (reported, GPU) / 15.8 (measured, CPU) against the FP16 limit of 65,504: no
+reductions. Maximum activation seen 16.4 (measured, GPU) / 15.8 (measured, CPU) against the FP16 limit of 65,504: no
 overflow risk.
+
+**Full 100k check on the GPU (measured, `results_gpu/archive_before_short_fp32/final/`, `results_gpu/final/`).** The
+official harness checks 2,000 passages; the rule applies to every one of the 100,000 hidden passages. We embedded all
+100,000 practice passages with our FP32 path (which matches the official references to 1.0000000) and compared:
+
+| Variant (stage 4, budget 8,192) | Min cos | < 0.999 | < 0.9995 | < 0.9999 | Longest passage < 0.9999 |
+|---|---|---|---|---|---|
+| Plain FP16 | 0.994402 | **2** | 5 | 28 | 23 tokens |
+| FP16 + FP32 residual (P1) | 0.997786 | **1** | 3 | 18 | 20 tokens |
+
+The worst passage (16 tokens, *"Transport in Gippsland (region) Shire of South Gippsland"*) fails even when encoded on
+its own, and the error of another changes with batch composition (0.99928 in one batch, 0.99854 in another), so this
+is FP16 arithmetic, not a scheduling bug. Above 32 tokens plain FP16 is ≥ 0.999992 with nothing below 0.9999. Hence P2:
+inputs of ≤ 32 tokens (5.5% of tokens) run in FP32, which is the reference maths, and the FP32 residual stream (12%
+slower in an interleaved 3-round comparison) is no longer needed.
 
 ## 12. GPU profiling methodology
 
@@ -188,10 +214,107 @@ Peak memory: `torch.cuda.max_memory_allocated` in-process, and device-level `nvi
 ## 13-18. GPU results: ablation, throughput, latency, memory, accuracy, profiles
 
 <!-- AUTO:gpu -->
-**PENDING - no GPU results in this checkout.** Run `bash run_all.sh` (and `--full`) on the RTX machine, copy `results_gpu/` here, then re-run `python scripts/make_report.py`.
+## Hardware and baseline (measured)
 
-Previously reported by the teammate (TRACKER.md, files not in the repository): reference 28.4 passages/s on the RTX 3050 Laptop GPU (5,000 passages); stage-4 FP16 min cos 0.999663 (passages) / 0.999982 (queries).
+- GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU (compute 8.6, 5.69 GiB, 20 SMs, BF16 True)
+- Software: Python 3.14.10, torch 2.15.0+cu132 (CUDA 13.2), transformers 5.24.0, tokenizers 0.23.3; OS Linux-7.3.5-arch1-1-x86_64-with-glibc2.44
+- Reference baseline: **28.4 passages/s** (reference.py, FP32, pad 512, first 5000 passages, 176 s)
+
+## Accuracy on the official references (measured)
+
+| Run | Passages min cos | Passages mean | Queries min cos | Max abs err | Verdict |
+|---|---|---|---|---|---|
+| validate_default | 0.999999 | 0.9999997 | 1.000000 | 0.00055 | PASS |
+| validate_fp16_plain | 0.999663 | 0.9999993 | 0.999982 | 0.00316 | PASS |
+| validate_bf16 | 0.997342 | 0.9999801 | 0.998891 | 0.00768 | FAIL |
+| validate_lax_reduction | 0.999991 | 0.9999998 | 0.999997 | 0.00062 | PASS |
+| validate_fp16_accum | 0.999636 | 0.9999962 | 0.999972 | 0.00325 | PASS |
+
+Edge-case suite: ALL PASS
+
+## Ablation (official bench.py)
+
+| Stage | Tag | Flags | N | Budget | Passages/s | Speed-up | Min cos | Viol. | Live p50 | Live p99 | Peak MiB | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | ablation 20k | fp16 res32 | 20000 | 65536 | 85.9 | 3.02 | 0.999991 | 0 |  |  | 2650 | ok |
+| 2 | ablation 20k | fp16 sort budget bucket res32 | 20000 | 65536 | 427.3 | 15.04 | 0.999991 | 0 |  |  | 2650 | ok |
+| 3 | ablation 20k + live | fp16 sort budget bucket overlap graph res32 | 20000 | 65536 | 426.5 | 15.02 | 0.999991 | 0 | 3.34 | 5.64 | 5496 | ok |
+| 4 | ablation 20k + live | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 65536 | 460.4 | 16.21 | 0.999991 | 0 | 3.34 | 5.77 | 5500 | ok |
+| 5 | ablation 20k + live | fp16 sort budget bucket overlap cls_only compile graph res32 | 20000 | 65536 | 493.7 | 17.38 | 0.99986 | 0 | 3.31 | 5.65 | 3228 | ok |
+| 4 | RES32 off | fp16 sort budget bucket overlap cls_only graph | 20000 | 65536 | 511.9 | 18.02 | 0.999663 | 0 |  |  | 5556 | ok |
+| 4 | O2b off | fp16 sort budget overlap cls_only graph res32 | 20000 | 65536 | 569.4 | 20.04 | 0.999991 | 0 |  |  | 2752 | ok |
+
+## Token-budget sweep (official bench.py, stage 4)
+
+| Stage | Tag | Flags | N | Budget | Passages/s | Speed-up | Min cos | Viol. | Live p50 | Live p99 | Peak MiB | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 4 | budget sweep | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 8192 | 621.1 | 21.87 | 0.999991 | 0 |  |  | 736 | ok |
+| 4 | budget sweep | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 16384 | 626.6 | 22.06 | 0.999991 | 0 |  |  | 1096 | ok |
+| 4 | budget sweep | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 32768 | 623.5 | 21.95 | 0.999991 | 0 |  |  | 2326 | ok |
+| 4 | budget sweep | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 65536 | 617.1 | 21.73 | 0.999991 | 0 |  |  | 5500 | ok |
+| 4 | budget sweep | fp16 sort budget bucket overlap cls_only graph res32 | 20000 | 131072 | 609.5 | 21.46 | 0.999991 | 0 |  |  | 4958 | ok |
+
+## Final run (official bench.py)
+
+| Stage | Tag | Flags | N | Budget | Passages/s | Speed-up | Min cos | Viol. | Live p50 | Live p99 | Peak MiB | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 4 | final 100k | fp16 sort budget bucket overlap cls_only graph short32<=32 | 100000 | 8192 | 604.9 | 21.3 | 0.999999 | 0 | 4.4 | 8.24 | 1622 | ok |
+
+## Live-query latency detail (non-official replay of bench.py timing)
+
+| Run | p50 ms | p90 | p95 | p99 | max | service p50 | service p99 | min cos |
+|---|---|---|---|---|---|---|---|---|
+| realtime_default | 4.31 | 4.61 | 6.16 | 8.17 | 10.94 | 4.17 | 4.42 | 1.000000 |
+| service_graph_on | - | - | - | - | - | 3.71 | 3.82 | 1.000000 |
+| service_graph_off | - | - | - | - | - | 4.05 | 4.61 | 1.000000 |
+
+## Profiler (torch.profiler, 2,000 passages; wall time includes profiler overhead)
+
+GPU time = sum of kernel + memcpy durations from the exported trace (`profile_run.py --resummarise` recomputes it). *of which FP32 GEMM*: the reference's GEMMs, or in the default config the short-input (P2) path.
+
+| Run | GPU kernel ms | GEMM | of which FP32 GEMM | Attention | Norm+elementwise | Memcpy | Other | Device busy | Idle gaps >100us | Tokenise share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| reference | 69674 | 74.9% | 74.9% | 17.9% | 7.1% | 0.0% | 0.0% | 0.992 | 136 | 0.007 |
+| stage1 | 17588 | 65.4% | 0.0% | 10.6% | 24.0% | 0.0% | 0.0% | 0.998 | 77 | 0.003 |
+| stage2 | 3735 | 68.7% | 0.0% | 6.3% | 25.0% | 0.0% | 0.0% | 0.996 | 29 | 0.013 |
+| default | 3325 | 79.0% | 16.5% | 7.3% | 13.6% | 0.1% | 0.0% | 0.997 | 7 | 0.014 |
+
+## Full 100k accuracy check (non-official)
+
+- Submitted config vs FP32 path on all 100,000 passages: min cos **0.999992**, mean 0.9999997, max abs error 0.00064, violations (<0.999) **0**, below 0.9995: 0
+- FP32 path vs official reference (first 2,000): min cos 1.000000
+- Worst input: #86483 (41 tokens) cos 0.999992
+
+![ablation](../reports/charts/ablation.png)
+
+![budget](../reports/charts/budget.png)
+
+![profile](../reports/charts/profile.png)
+
 <!-- /AUTO:gpu -->
+
+### Decision runs: interleaved repeats (measured, `results_gpu/repeats/`, `results_gpu/repeats_p2/`)
+
+The 20k ablation above was run once per row at budget 65,536, where the laptop GPU used ~90% of its memory and
+timings drifted (the same stage-4 configuration measured 460 p/s in the ablation and 617 p/s in the sweep). Every
+design decision was therefore re-measured with 3 interleaved rounds at a small budget (spread ±1.5%):
+
+| Comparison (stage 4, 20k passages) | Budget | Mean passages/s | Min cos (official 2,000) | 100k violations | Decision |
+|---|---|---|---|---|---|
+| FP32 residual + O2b (then default) | 16,384 | 627.6 | 0.999991 | 1 | - |
+| same, FP32 residual off | 16,384 | 701.9 | 0.999663 | 2 | - |
+| same, O2b off | 16,384 | 609.6 | 0.999991 | - | **keep O2b** (+2.9%) |
+| Plain FP16 everywhere | 8,192 | 692.2 | 0.999663 | 2 | rejected: fails 100k |
+| FP16 + FP32 residual (P1) | 8,192 | 619.0 | 0.999991 | 1 | rejected: fails 100k |
+| **FP16 + short inputs in FP32 (P2, submitted)** | 8,192 | 598.7 | 0.999999 | **0** | **submitted** |
+
+The budget 8,192 was chosen by `scripts/apply_best_config.py` from the sweep: within 1% of the fastest budget
+(16,384) at a third of the memory (736 MiB vs 1,096 MiB peak), which is the safer choice on an unknown judging GPU.
+
+Live path: the 32-token CUDA Graph now runs the FP32 encoder (P2), so typical queries get reference maths. Service
+time per query is 3.71 ms (graph) vs 4.05 ms (eager); with FP16 it was 1.76 ms vs 2.49 ms. FP32 single queries are
+bound by reading 440 MB of FP32 weights, which a graph cannot remove. We accept ~2 ms of p50 for zero precision risk:
+one violation on the hidden trace would score zero, while latency is 15% of the score.
 
 ### CPU dry runs (not GPU scores)
 
@@ -212,6 +335,9 @@ CPU dry runs of the official `bench.py` (FP32 on a CPU; they prove the scheduler
 
 ## 19. Limitations
 
+- Laptop GPU timings drift: the same configuration measured 460 and 617 passages/s 25 minutes apart when the token
+  budget used ~90% of VRAM. Decisions are therefore based on interleaved, repeated runs at a small budget (±1.5%).
+
 - GPU numbers are for an RTX 3050 Laptop GPU (6 GB); the organisers' GPU will give different absolute numbers. The
   code adapts (token budget halves automatically on a smaller GPU; graphs/compile fall back to eager if unsupported).
 - The reference baseline is a 5,000-passage sample. This is valid because the reference pads every input to 512, so
@@ -223,7 +349,14 @@ CPU dry runs of the official `bench.py` (FP32 on a CPU; they prove the scheduler
 
 ## 20. Conclusions
 
-PENDING the GPU runs: final speed-up, p50/p99 and worst-case cosine on 100k passages.
+On the RTX 3050 6GB Laptop GPU the submitted `team.py` embeds 100,000 passages at **604.9 passages/s, 21.3x the
+reference**, with every one of the 100,000 practice passages at cosine ≥ 0.999992 to FP32, and answers live queries
+in p50 4.4 ms / p99 8.2 ms. The gains came in the order the analysis predicted: FP16 kernels (3x), removing padding
+(5x more on top), then the host pipeline and the CLS-only last layer. The profile moved from 75% FP32 GEMM time with
+136 idle gaps to Tensor-Core GEMMs with 7 idle gaps, the GPU busy 99.7% of the span. The most important finding was not
+a speed-up: checking all 100,000 passages rather than the official 2,000 exposed FP16 failures on a few short
+passages that the official check could not see, and routing inputs of ≤ 32 tokens through FP32 removed them for 3%
+of throughput.
 
 ## 21. Future work
 

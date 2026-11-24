@@ -18,13 +18,13 @@ https://ui.perfetto.dev (drag the file in), and the architecture diagram (report
 
 | Time | Show | Say |
 |---|---|---|
-| 0:00 | `python demo.py --data data`, section 1 | "Same model, same weights. This is what runs: FP16 Tensor Cores, sorted token-budget batches, CUDA Graphs." |
+| 0:00 | `python demo.py --data data`, section 1 | "Same model, same weights. This is what runs: FP16 Tensor Cores for long inputs, exact FP32 for inputs of 32 tokens or less, sorted token-budget batches, CUDA Graphs." |
 | 0:45 | Section 2: cosine per text | "Empty string, one word, a 900-word text cut at 512 tokens, Unicode: every cosine is above 0.9995. The rule is 0.999 on every input." |
 | 1:30 | Section 3: padding | "The reference computes 512 positions per passage; the average passage has 100 tokens. 80% of its work is padding." |
-| 2:15 | Section 4: throughput | "Same passages, same machine, end to end including tokenisation: X passages/s vs Y. The official bench.py number is in the report." |
-| 3:15 | Section 5: live queries | "One query at a time, like the harness: a CUDA Graph replay, about Z ms." |
+| 2:15 | Section 4: throughput | "Same passages, same machine, end to end including tokenisation: about 590 passages/s vs 29 (20.6x on this run). The official bench.py number on all 100k is 604.9 p/s, 21.3x." |
+| 3:15 | Section 5: live queries | "One query at a time, like the harness: a CUDA Graph replay, about 3.7 ms. Queries are short, so they run in FP32 - we chose zero precision risk over 2 ms." |
 | 3:45 | Section 6: search | "And it still does its job: on a small demo library, each question finds the right passage." |
-| 4:15 | Perfetto: reference trace vs ours | "Before: long FP32 GEMMs on padding, gaps while the CPU tokenises. After: dense FP16 kernels, no gaps." |
+| 4:15 | Perfetto: reference trace vs ours | "Before: FP32 GEMMs on padding, 136 idle gaps. After: Tensor-Core GEMMs, 7 idle gaps, GPU busy 99.7% of the time." |
 | 5:15 | Report: ablation chart | "Each step measured on its own with the official harness, so you can see what each idea is worth." |
 
 If the GPU is unavailable: `python demo.py --data data --n 200` runs on any CPU (numbers labelled as not

@@ -54,7 +54,7 @@ fi
 if want validate; then
   [ -s $R/accuracy/validate_default.json ] || run "validate submitted default (2,000 passages + 1,500 queries)" \
     env PS09_DEBUG=1 "$PY" validate.py --data data --out $R/accuracy/validate_default.json
-  [ -s $R/accuracy/validate_fp16_plain.json ] || run "validate plain FP16 residual stream (PS09_RES32=0)"     env PS09_RES32=0 PS09_DEBUG=1 "$PY" validate.py --data data --out $R/accuracy/validate_fp16_plain.json
+  [ -s $R/accuracy/validate_fp16_plain.json ] || run "validate plain FP16 residual stream (PS09_RES32=0)"     env PS09_RES32=0 PS09_SHORT_FP32=0 PS09_DEBUG=1 "$PY" validate.py --data data --out $R/accuracy/validate_fp16_plain.json
   [ -s $R/accuracy/validate_bf16.json ] || run "validate BF16 variant (experiment)" \
     env PS09_BF16=1 "$PY" validate.py --data data --out $R/accuracy/validate_bf16.json
   [ -s $R/accuracy/validate_lax_reduction.json ] || run "validate with cuBLAS reduced-precision reductions allowed (experiment)" \
@@ -105,7 +105,7 @@ if [ $FULL = 1 ] || [ "$ONLY" = "full" ]; then
     "$PY" run_ablation.py --data data --stages $("$PY" -c "import re;print(re.search(r'^DEFAULT_STAGE = (\d+)', open('team.py').read(), re.M).group(1))") --out-dir $R/final --tag "final 100k"
   [ -s $R/final/submitted_100k.json ] || run "full 100k embeddings, submitted default" "$PY" scripts/full_check.py run --data data --out $R/final/submitted_100k.npy
   [ -s $R/final/fp32_100k.json ] || run "full 100k embeddings, FP32 path (reference maths)" env PS09_STAGE=2 PS09_FP16=0 "$PY" scripts/full_check.py run --data data --out $R/final/fp32_100k.npy
-  [ -s $R/final/fp16plain_100k.json ] || run "full 100k embeddings, plain FP16 residual (RES32 off)" env PS09_RES32=0 "$PY" scripts/full_check.py run --data data --out $R/final/fp16plain_100k.npy
+  [ -s $R/final/fp16plain_100k.json ] || run "full 100k embeddings, plain FP16 (RES32 off, SHORT_FP32 off)" env PS09_RES32=0 PS09_SHORT_FP32=0 "$PY" scripts/full_check.py run --data data --out $R/final/fp16plain_100k.npy
   [ -s $R/final/full_check_fp16plain.json ] || run "compare 100k: plain FP16 vs FP32" "$PY" scripts/full_check.py compare --data data --a $R/final/fp16plain_100k.npy --b $R/final/fp32_100k.npy --out $R/final/full_check_fp16plain.json
   [ -s $R/final/full_check.json ] || run "compare 100k: submitted vs FP32" "$PY" scripts/full_check.py compare --data data --a $R/final/submitted_100k.npy --b $R/final/fp32_100k.npy --out $R/final/full_check.json
 fi

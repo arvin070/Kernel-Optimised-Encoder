@@ -249,7 +249,7 @@ def find_browser():
     for c in cands:
         if os.path.exists(c):
             return c
-    for n in ("msedge", "google-chrome", "chromium", "chromium-browser"):
+    for n in ("msedge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave", "brave-browser"):
         if shutil.which(n):
             return shutil.which(n)
     return None
